@@ -1,0 +1,8 @@
+parameters:
+    level: 6
+    paths:
+        - src
+    bootstrapFiles:
+        - tests/bootstrap.php
+    # Runtime validation remains necessary for array contents supplied by callers.
+    treatPhpDocTypesAsCertain: false

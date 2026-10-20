@@ -1,0 +1,35 @@
+{
+    "name": "survos/bagit",
+    "description": "Framework-independent BagIt directory creation and integrity verification",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": "^8.5",
+        "ext-hash": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^13.0",
+        "symfony/finder": "^7.4 || ^8.0",
+        "league/flysystem": "^3.0",
+        "league/flysystem-local": "^3.0",
+        "phpstan/phpstan": "^2.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Survos\\BagIt\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Survos\\BagIt\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "analyse": "phpstan analyse"
+    },
+    "suggest": {
+        "symfony/finder": "Use FinderSource for explicit payload selections (^7.4 or ^8.0).",
+        "league/flysystem": "Use FlysystemSource with existing storage zones (^3.0)."
+    }
+}
