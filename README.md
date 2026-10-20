@@ -1,13 +1,20 @@
 # survos/bagit
 
-A plain PHP 8.5+ library for BagIt directories. No Symfony container, bundle, provider
-parser, command, S3 client, workflow or payload-extension policy is required.
+A PHP 8.5+ integration library built on
+[BagItTools](https://github.com/whikloj/BagItTools). BagItTools supplies bag
+declarations, manifest generation, checksum validation and ordered metadata
+reading. This package adds streaming Finder/Flysystem sources, conservative path
+checks, offline verification, BagIt 0.96 compatibility and atomic local publication.
+No Symfony container or bundle is required.
 
-The implementation follows [RFC 8493](https://www.rfc-editor.org/rfc/rfc8493.html)
-within the explicit compatibility limits below. It generalizes the manifest path,
-duplicate-entry and checksum checks in Harvest's `PennStateBag`, adds streaming
-file I/O and full-directory coverage, and uses the staging/locking approach already
-used by Harvest's Penn conversion tooling. Provider and issue parsing remain there.
+Background: [BagIt on Wikipedia](https://en.wikipedia.org/wiki/BagIt),
+[BagIt 1.0 specification (RFC 8493)](https://www.rfc-editor.org/rfc/rfc8493.html),
+and the [0.96 specification](https://www.ietf.org/archive/id/draft-kunze-bagit-05.txt).
+
+The dependency is the released `whikloj/bagittools:^6.0.1`, not a fork. Its current
+release requires PEAR's `archive_tar`; this integration does not invoke archive
+operations. [Upstream PR #80](https://github.com/whikloj/BagItTools/pull/80) proposes
+making that dependency optional. No claim is made that PEAR is slower than PharData.
 
 ## Directory API
 
@@ -36,13 +43,48 @@ preserved. `Payload-Oxum` is generated automatically and cannot be supplied.
 `IntegrityException` identifies invalid, incomplete, unsafe or unsupported bag
 contents. Invalid API metadata raises `InvalidArgumentException`; I/O and
 publication failures raise `RuntimeException` (underlying adapter exceptions are
-preserved). Verification stops at the first error and does not return a partial
-success. `Manifest::read($file, $algorithm)` is also available for integrations
+preserved). `verify()` uses the inspection pipeline and throws its first reported
+error; a failed inspection never returns partial verification. `Manifest::read($file, $algorithm)` is also available for integrations
 that need the path-to-digest map, without claiming that the full bag was verified.
+
+## Diagnostics and ordered metadata
+
+```php
+$inspection = $bags->inspect('/archive/bag');
+if (!$inspection->isValid()) {
+    foreach ($inspection->errors as $error) {
+        // Stable integration category, explanatory message, path and manifest.
+        printf("%s: %s\n", $error->code, $error->message);
+    }
+}
+// Warnings (for example legacy MD5) are separate and do not invalidate a bag.
+$warnings = $inspection->warnings;
+$verification = $inspection->verification; // null on any error
+
+foreach ($bags->readMetadata('/archive/bag') as $entry) {
+    printf("%s: %s\n", $entry->label, $entry->value);
+}
+```
+
+`readMetadata()` returns a `list<MetadataEntry>` preserving field order, casing
+and repeated/interleaved labels. Values and continuation-line unfolding follow
+BagItTools. An absent optional `bag-info.txt` produces an empty list. Reading
+metadata is not checksum verification. Both APIs enforce the offline profile guard.
+
+Diagnostics accumulate independent missing/unlisted payloads, checksum failures,
+metadata errors and warnings. Unsafe trees/declarations/profiles stop inspection
+before upstream loading; unsafe manifest syntax/references stop checksum access.
+The result is not an exhaustive report of defects hidden behind an unsafe input.
+Categories include `unsafe_or_unsupported_bag`, `invalid_manifest`,
+`invalid_reference`, `missing_manifest`, `missing_file`, `missing_tag_coverage`,
+`unlisted_payload`, `manifest_error`, `bagittools_error`, `invalid_oxum`,
+`incomplete_fetch` and `unsafe_fetch`. Upstream message text is preserved rather
+than parsed into unstable pseudo-codes; a manifest diagnostic's path identifies
+the manifest and its message names the affected payload.
 
 ## Optional file source adapters
 
-The core depends only on PHP and ext-hash. Install `symfony/finder` or
+The core requires BagItTools and its declared PHP extensions/dependencies. Install `symfony/finder` or
 `league/flysystem` in the consuming application when using the corresponding adapter.
 `FileSource` has two methods: `files(): iterable<string>` and
 `readStream(string $path): mixed` (a readable binary resource at position zero).
@@ -112,11 +154,13 @@ prepare parent directories and manage lifecycle outside this library.
 
 ## Guarantees and limits
 
-- Reads BagIt 0.9, 0.97 and 1.0 with UTF-8 tag files; creates 1.0. Other versions
+- Reads BagIt 0.9, 0.96, 0.97 and 1.0 with UTF-8 tag files; creates 1.0. Other versions
   and character encodings fail explicitly. Supports MD5, SHA-1, SHA-256 and SHA-512.
-- Every payload manifest must list every payload file exactly once. Every checksum
+- For 1.0, every payload manifest must list every payload file exactly once.
+  Version 0.96 permits collective coverage across manifests and literal percent
+  characters in paths; its tag manifests need not include every payload manifest. Every checksum
   in every payload/tag manifest is checked; missing, altered or unlisted payloads
-  fail. Tag manifests are optional; when present they must cover every payload
+  fail. Tag manifests are optional; when present in 1.0 they must cover every payload
   manifest, cannot list payloads or other tag manifests, and all listed tag files
   must exist and match. Payload-Oxum, when present, must match counts and bytes.
 - Manifest readers support LF, CRLF, CR, uppercase digests, legacy `*` checksum-tool
@@ -125,7 +169,7 @@ prepare parent directories and manage lifecycle outside this library.
   paths are rejected as a conservative portable path policy. No URL decoding of
   arbitrary escapes is performed. Local trees reject symlinks and special files.
 - Hashing and copying stream payload bytes. Memory is proportional to the number
-  and length of filenames/manifest entries, plus the longest metadata line, not
+  and length of filenames/manifest entries, plus tag-file contents loaded by BagItTools, not
   payload file sizes. File inventories and manifest entries are held in memory.
 - Identical payload bytes, paths, metadata order and algorithm produce identical
   manifest/tag bytes. No timestamps are inserted. Compressed inputs are copied
@@ -139,7 +183,11 @@ prepare parent directories and manage lifecycle outside this library.
   are outside the guarantee; keep sources immutable and destinations controlled.
 - `fetch.txt` never triggers network access. Its files must already be present
   and checksummed, and declared lengths must match. Remote-hole bags must be
-  materialized by the application before verification can succeed.
+  materialized by the application before verification can succeed. We call the
+  upstream manifest validators directly, not `Bag::isValid()` (which downloads
+  fetch entries). Bags declaring `BagIt-Profile-Identifier` are rejected before
+  upstream loading, because BagItTools otherwise resolves that URL automatically.
+  Offline profile resolution is not supported in this version.
 - BagIt checksums detect corruption; they do not authenticate a publisher. Supply
   trusted manifests or an external signature/authenticated catalog as needed.
 

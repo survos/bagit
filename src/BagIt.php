@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace Survos\BagIt;
 
+use Survos\BagIt\Internal\CheckedManifest;
+use Survos\BagIt\Internal\Inspector;
 use Survos\BagIt\Source\FileSource;
 use Survos\BagIt\Source\LocalDirectorySource;
+use whikloj\BagItTools\Bag;
 
 final class BagIt
 {
@@ -30,9 +33,7 @@ final class BagIt
         $files = $this->inventory($source);
 
         return Filesystem::publish($destination, function (string $stage) use ($source, $files, $metadata, $algorithm): Verification {
-            if (!mkdir($stage.'/data', 0700)) {
-                throw new \RuntimeException('Cannot create payload directory.');
-            }
+            $engine = Bag::create($stage);
             $paths = [];
             $bytes = 0;
             foreach ($files as $file) {
@@ -44,10 +45,9 @@ final class BagIt
                 }
                 $bytes += $size;
             }
-            Filesystem::write($stage.'/bagit.txt', "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n");
             $info = '';
             foreach ($metadata as $label => $values) {
-                if (!is_string($label) || '' === $label || trim($label) !== $label || preg_match('/[:\r\n\x00]/', $label) || 1 !== preg_match('//u', $label) || 0 === strcasecmp($label, 'Payload-Oxum')) {
+                if (!is_string($label) || '' === $label || trim($label) !== $label || preg_match('/[:\r\n\x00]/', $label) || 1 !== preg_match('//u', $label) || in_array(strtolower($label), ['payload-oxum', 'bagit-profile-identifier'], true)) {
                     throw new \InvalidArgumentException('Invalid or reserved bag-info label.');
                 }
                 foreach (is_array($values) ? $values : [$values] as $value) {
@@ -60,99 +60,36 @@ final class BagIt
             $info .= 'Payload-Oxum: '.$bytes.'.'.count($paths)."\n";
             Filesystem::write($stage.'/bag-info.txt', $info);
             $manifest = 'manifest-'.$algorithm.'.txt';
-            Manifest::write($stage, $stage.'/'.$manifest, $paths, $algorithm);
-            Manifest::write($stage, $stage.'/tagmanifest-'.$algorithm.'.txt', ['bagit.txt', 'bag-info.txt', $manifest], $algorithm);
+            (new CheckedManifest($engine, $algorithm, $manifest, array_fill_keys($paths, '')))->update();
+            $tags = ['bag-info.txt', 'bagit.txt', $manifest];
+            sort($tags, SORT_STRING);
+            (new CheckedManifest($engine, $algorithm, 'tagmanifest-'.$algorithm.'.txt', array_fill_keys($tags, '')))->update();
 
             return $this->verify($stage);
         });
     }
 
-    /** Verify every checksum and require each payload manifest to cover exactly all payload files. */
+    /** Verify offline, throwing the first diagnostic on failure. */
     public function verify(string $directory): Verification
     {
-        $root = Filesystem::root($directory);
-        $files = array_fill_keys(Filesystem::files($root), true);
-        if (!isset($files['bagit.txt']) || !is_dir($root.'/data')) {
-            throw new IntegrityException('Missing bagit.txt or data directory.');
-        }
-        $declaration = iterator_to_array(Manifest::lines($root.'/bagit.txt'));
-        if (2 !== count($declaration) || !preg_match('/^BagIt-Version: (0\.9|0\.97|1\.0)$/D', $declaration[0], $match)
-            || 0 !== strcasecmp($declaration[1], 'Tag-File-Character-Encoding: UTF-8')) {
-            throw new IntegrityException('Unsupported or malformed BagIt declaration (requires 0.9, 0.97 or 1.0 and UTF-8).');
-        }
-        $version = $match[1];
-        $payload = array_filter($files, static fn (string|int $path): bool => str_starts_with((string) $path, 'data/'), ARRAY_FILTER_USE_KEY);
-        $manifests = [];
-        $tags = [];
-        foreach ($files as $path => $_) {
-            $path = (string) $path;
-            if (preg_match('/^(tag)?manifest-([^\/]+)\.txt$/D', $path, $match)) {
-                Manifest::algorithm($match[2]);
-                if ('' === $match[1]) {
-                    $manifests[$path] = $match[2];
-                } else {
-                    $tags[$path] = $match[2];
-                }
-            }
-        }
-        if ([] === $manifests) {
-            throw new IntegrityException('Missing payload manifest.');
-        }
-        foreach ($tags as $path => $algorithm) {
-            $entries = Manifest::read($root.'/'.$path, $algorithm);
-            foreach ($entries as $entry => $digest) {
-                $entry = (string) $entry;
-                if (str_starts_with($entry, 'data/') || isset($tags[$entry])) {
-                    throw new IntegrityException('Forbidden tag manifest reference: '.$entry);
-                }
-                $this->check($root, $files, $entry, $algorithm, $digest);
-            }
-            if ([] !== array_diff_key($manifests, $entries)) {
-                throw new IntegrityException('Tag manifest omits a payload manifest: '.$path);
-            }
-        }
-        foreach ($manifests as $path => $algorithm) {
-            $entries = Manifest::read($root.'/'.$path, $algorithm);
-            foreach ($entries as $entry => $digest) {
-                $entry = (string) $entry;
-                if (!str_starts_with($entry, 'data/')) {
-                    throw new IntegrityException('Manifest references a non-payload path: '.$entry);
-                }
-                $this->check($root, $files, $entry, $algorithm, $digest);
-            }
-            $unlisted = array_diff_key($payload, $entries);
-            if ([] !== $unlisted) {
-                throw new IntegrityException('Unlisted payload in '.$path.': '.array_key_first($unlisted));
-            }
-        }
-        $bytes = 0;
-        foreach ($payload as $path => $_) {
-            $size = filesize($root.'/'.$path);
-            if (false === $size) {
-                throw new \RuntimeException('Cannot determine size: '.$path);
-            }
-            $bytes += $size;
-        }
-        if (isset($files['bag-info.txt'])) {
-            $this->checkOxum($root.'/bag-info.txt', $bytes, count($payload));
-        }
-        if (isset($files['fetch.txt'])) {
-            foreach (Manifest::lines($root.'/fetch.txt') as $line) {
-                if (!preg_match('/^\S+:[^ \t]*[ \t]+(-|[0-9]+)[ \t]+(.+)$/Du', $line, $match)) {
-                    throw new IntegrityException('Malformed fetch.txt entry.');
-                }
-                if (preg_match('/%(?!25|0[aAdD])/', $match[2])) {
-                    throw new IntegrityException('Invalid fetch.txt path escape.');
-                }
-                $path = str_ireplace(['%0A', '%0D', '%25'], ["\n", "\r", '%'], $match[2]);
-                Filesystem::path($path);
-                if (!isset($payload[$path]) || ('-' !== $match[1] && (string) filesize($root.'/'.$path) !== $match[1])) {
-                    throw new IntegrityException('Missing payload or incorrect length in fetch.txt: '.$path);
-                }
-            }
+        $inspection = $this->inspect($directory);
+        if (null === $inspection->verification) {
+            throw new IntegrityException($inspection->errors[0]->message);
         }
 
-        return new Verification($root, $version, count($payload), $bytes, array_values($manifests));
+        return $inspection->verification;
+    }
+
+    /** Collect diagnostics without downloading fetch entries or changing bag files. */
+    public function inspect(string $directory): Inspection
+    {
+        return (new Inspector())->inspect($directory);
+    }
+
+    /** @return list<MetadataEntry> Ordered fields, preserving repeated labels and their casing. */
+    public function readMetadata(string $directory): array
+    {
+        return (new Inspector())->metadata($directory);
     }
 
     /** Copy a complete directory bag, verify the staged copy, and publish without overwriting. */
@@ -173,7 +110,7 @@ final class BagIt
         $files = $this->inventory($source);
 
         return Filesystem::publish($destination, function (string $stage) use ($source, $files): Verification {
-            if (!mkdir($stage.'/data', 0700)) {
+            if (!mkdir($stage.'/data', 0700, true)) {
                 throw new \RuntimeException('Cannot create payload directory.');
             }
             foreach ($files as $file) {
@@ -234,52 +171,5 @@ final class BagIt
         } finally {
             fclose($input);
         }
-    }
-
-    /** @param array<string, bool> $files */
-    private function check(string $root, array $files, string $path, string $algorithm, string $digest): void
-    {
-        if (!isset($files[$path])) {
-            throw new IntegrityException('Missing manifest-listed file: '.$path);
-        }
-        if (!hash_equals($digest, Filesystem::digest($root.'/'.$path, $algorithm))) {
-            throw new IntegrityException('BagIt checksum mismatch: '.$path);
-        }
-    }
-
-    private function checkOxum(string $file, int $bytes, int $count): void
-    {
-        $found = false;
-        $label = null;
-        $value = '';
-        foreach (Manifest::lines($file) as $line) {
-            if (1 !== preg_match('//u', $line)) {
-                throw new IntegrityException('Non-UTF-8 bag-info.txt.');
-            }
-            if (preg_match('/^[ \t]+(.*)$/D', $line, $match) && null !== $label) {
-                $value .= $match[1];
-                continue;
-            }
-            $found = $this->checkOxumField($label, $value, $found, $bytes, $count);
-            if (!preg_match('/^([^:\r\n]+?)[ \t]*:[ \t]+(.*)$/D', $line, $match) || trim($match[1]) !== $match[1]) {
-                throw new IntegrityException('Malformed bag-info.txt field.');
-            }
-            $label = $match[1];
-            $value = $match[2];
-        }
-        $this->checkOxumField($label, $value, $found, $bytes, $count);
-    }
-
-    private function checkOxumField(?string $label, string $value, bool $found, int $bytes, int $count): bool
-    {
-        if (null !== $label && 0 === strcasecmp($label, 'Payload-Oxum')) {
-            if ($found || $value !== $bytes.'.'.$count) {
-                throw new IntegrityException('Invalid or mismatched Payload-Oxum.');
-            }
-
-            return true;
-        }
-
-        return $found;
     }
 }

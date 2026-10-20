@@ -87,11 +87,12 @@ final class Filesystem
             if (!mkdir($stage, 0700)) {
                 throw new \RuntimeException('Cannot create staging directory: '.$stage);
             }
-            $report = $build($stage);
+            $report = $build($stage.'/bag');
             self::requireAbsent($destination);
-            if (!rename($stage, $destination)) {
+            if (!rename($stage.'/bag', $destination)) {
                 throw new \RuntimeException('Cannot publish bag: '.$destination);
             }
+            rmdir($stage);
             $stage = null;
 
             return new Verification($destination, $report->version, $report->payloadFiles, $report->payloadBytes, $report->payloadAlgorithms);

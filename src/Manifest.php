@@ -10,9 +10,12 @@ final class Manifest
     public const array ALGORITHMS = ['md5', 'sha1', 'sha256', 'sha512'];
 
     /** @return array<string, string> Relative path => lowercase digest. */
-    public static function read(string $file, string $algorithm): array
+    public static function read(string $file, string $algorithm, string $version = '1.0'): array
     {
         self::algorithm($algorithm);
+        if (!in_array($version, ['0.9', '0.96', '0.97', '1.0'], true)) {
+            throw new IntegrityException('Unsupported manifest version: '.$version);
+        }
         $length = strlen(hash($algorithm, ''));
         $entries = [];
         foreach (self::lines($file) as $line) {
@@ -20,10 +23,10 @@ final class Manifest
                 throw new IntegrityException('Malformed manifest entry in '.$file);
             }
             // Decode only the three escapes defined by BagIt, once; %252F is a literal %2F.
-            if (preg_match('/%(?!25|0[aAdD])/', $match[2])) {
+            if ('0.96' !== $version && preg_match('/%(?!25|0[aAdD])/', $match[2])) {
                 throw new IntegrityException('Invalid manifest path escape in '.$file);
             }
-            $path = str_ireplace(['%0A', '%0D', '%25'], ["\n", "\r", '%'], $match[2]);
+            $path = '0.96' === $version ? $match[2] : str_ireplace(['%0A', '%0D', '%25'], ["\n", "\r", '%'], $match[2]);
             Filesystem::path($path);
             if (isset($entries[$path])) {
                 throw new IntegrityException('Duplicate manifest path: '.$path);
@@ -38,23 +41,24 @@ final class Manifest
     public static function write(string $root, string $file, array $paths, string $algorithm): void
     {
         self::algorithm($algorithm);
+        $root = Filesystem::root($root);
+        $files = array_fill_keys(Filesystem::files($root), true);
+        Internal\Inspector::version($root);
+        Internal\Inspector::requireOffline($root);
+        if (realpath(dirname($file)) !== $root || file_exists($file) || is_link($file)) {
+            throw new \InvalidArgumentException('Manifest must be a new file in the bag root.');
+        }
+        Filesystem::path(basename($file));
         sort($paths, SORT_STRING);
-        $stream = fopen($file, 'xb');
-        if (false === $stream) {
-            throw new \RuntimeException('Cannot create manifest: '.$file);
-        }
-        try {
-            foreach ($paths as $path) {
-                Filesystem::path($path);
-                $encoded = str_replace(['%', "\r", "\n"], ['%25', '%0D', '%0A'], $path);
-                $line = Filesystem::digest($root.'/'.$path, $algorithm).'  '.$encoded."\n";
-                if (strlen($line) !== fwrite($stream, $line)) {
-                    throw new \RuntimeException('Incomplete manifest write: '.$file);
-                }
+        $hashes = [];
+        foreach ($paths as $path) {
+            Filesystem::path($path);
+            if (!isset($files[$path]) || isset($hashes[$path])) {
+                throw new IntegrityException('Missing or duplicate manifest source: '.$path);
             }
-        } finally {
-            fclose($stream);
+            $hashes[$path] = '';
         }
+        (new Internal\CheckedManifest(\whikloj\BagItTools\Bag::load($root), $algorithm, basename($file), $hashes))->update();
     }
 
     public static function algorithm(string $algorithm): void

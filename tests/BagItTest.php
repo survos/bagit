@@ -67,13 +67,13 @@ final class BagItTest extends TestCase
         self::assertSame(['md5'], $this->bags->verify($root)->payloadAlgorithms);
         file_put_contents($root.'/bagit.txt', "BagIt-Version: 1.0\nTag-File-Character-Encoding: UTF-8\n");
         $this->expectException(IntegrityException::class);
-        $this->expectExceptionMessage('checksum mismatch: bagit.txt');
+        $this->expectExceptionMessage('does not match manifest');
         $this->bags->verify($root);
     }
 
     public static function corruptions(): iterable
     {
-        yield 'tampered' => ['tampered', 'checksum mismatch'];
+        yield 'tampered' => ['tampered', 'does not match manifest'];
         yield 'missing' => ['missing', 'Missing manifest-listed'];
         yield 'unlisted' => ['unlisted', 'Unlisted payload'];
         yield 'symlink' => ['symlink', 'Symlink'];
@@ -215,7 +215,7 @@ final class BagItTest extends TestCase
         }
         fclose($stream);
         $script = $this->root.'/verify.php';
-        file_put_contents($script, '<?php define("BAGIT_CORE_ONLY", true); require '.var_export(__DIR__.'/bootstrap.php', true).'; $b = new \Survos\BagIt\BagIt(); $r = $b->create($argv[1], $argv[2]); echo $b->verify($r->directory)->payloadFiles;');
+        file_put_contents($script, '<?php require '.var_export(__DIR__.'/bootstrap.php', true).'; $b = new \Survos\BagIt\BagIt(); $r = $b->create($argv[1], $argv[2]); echo $b->verify($r->directory)->payloadFiles;');
         $process = proc_open([PHP_BINARY, '-d', 'memory_limit=16M', $script, $this->root.'/source', $this->root.'/large-bag'], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
         self::assertIsResource($process);
         $output = stream_get_contents($pipes[1]);
@@ -294,7 +294,7 @@ final class BagItTest extends TestCase
     public function testConcurrentWritersPublishExactlyOneCompleteBag(): void
     {
         $script = $this->root.'/writer.php';
-        file_put_contents($script, '<?php define("BAGIT_CORE_ONLY", true); require '.var_export(__DIR__.'/bootstrap.php', true).'; try { (new \Survos\BagIt\BagIt())->create($argv[1], $argv[2]); } catch (\RuntimeException $e) { fwrite(STDERR, $e->getMessage()); exit(2); }');
+        file_put_contents($script, '<?php require '.var_export(__DIR__.'/bootstrap.php', true).'; try { (new \Survos\BagIt\BagIt())->create($argv[1], $argv[2]); } catch (\RuntimeException $e) { fwrite(STDERR, $e->getMessage()); exit(2); }');
         $processes = [];
         $streams = [];
         for ($i = 0; $i < 2; ++$i) {
@@ -348,5 +348,106 @@ final class BagItTest extends TestCase
         file_put_contents($this->root.'/bag/fetch.txt', "https://example.test/info.json 3 data/info.json\n");
         $this->expectException(IntegrityException::class);
         $this->bags->verify($this->root.'/bag');
+    }
+
+    public function testLegacy096UsesCollectiveCoverageAndLiteralPercentPaths(): void
+    {
+        $root = $this->root.'/legacy';
+        mkdir($root.'/data', 0700, true);
+        file_put_contents($root.'/bagit.txt', "BagIt-Version: 0.96\nTag-File-Character-Encoding: UTF-8\n");
+        file_put_contents($root.'/data/percent%2F.xml', 'xml');
+        file_put_contents($root.'/data/page.jp2', 'jp2');
+        file_put_contents($root.'/manifest-md5.txt', md5('xml')." *data/percent%2F.xml\n");
+        file_put_contents($root.'/manifest-sha1.txt', sha1('jp2')." data/page.jp2\n");
+        file_put_contents($root.'/tagmanifest-md5.txt', md5(file_get_contents($root.'/bagit.txt'))." bagit.txt\n");
+        file_put_contents($root.'/fetch.txt', "http://127.0.0.1:1/not-used 3 data/percent%2F.xml\n");
+        file_put_contents($root.'/bag-info.txt', "Source-Organization :Example\nContact-Name:One\nDescription:First\n  Second\nContact-Name:Two\n");
+        $result = $this->bags->verify($root);
+        self::assertSame('0.96', $result->version);
+        self::assertSame(2, $result->payloadFiles);
+        self::assertSame(6, $result->payloadBytes);
+        $metadata = $this->bags->readMetadata($root);
+        self::assertSame(['Source-Organization', 'Contact-Name', 'Description', 'Contact-Name'], array_column($metadata, 'label'));
+        self::assertSame(['One', 'Two'], [$metadata[1]->value, $metadata[3]->value]);
+        self::assertStringContainsString('Second', $metadata[2]->value);
+        file_put_contents($root.'/data/page.jp2', 'corrupt');
+        self::assertFalse($this->bags->inspect($root)->isValid());
+    }
+
+    public function testInspectionCollectsIndependentErrorsAndNeverReturnsPartialVerification(): void
+    {
+        $root = $this->root.'/bag';
+        $this->bags->create($this->root.'/source', $root);
+        file_put_contents($root.'/data/info.json', 'tampered');
+        unlink($root.'/data/image.jp2');
+        file_put_contents($root.'/data/unlisted', 'extra');
+        $report = $this->bags->inspect($root);
+        self::assertFalse($report->isValid());
+        self::assertNull($report->verification);
+        $codes = array_column($report->errors, 'code');
+        self::assertContains('missing_file', $codes);
+        self::assertContains('unlisted_payload', $codes);
+        self::assertContains('manifest_error', $codes);
+        self::assertContains('data/image.jp2', array_column($report->errors, 'path'));
+        self::assertContains('manifest-sha256.txt', array_column($report->errors, 'manifest'));
+    }
+
+    public function testOrderedMetadataReaderAndMissingOptionalMetadata(): void
+    {
+        $root = $this->root.'/bag';
+        $this->bags->create($this->root.'/source', $root);
+        unlink($root.'/tagmanifest-sha256.txt');
+        file_put_contents($root.'/bag-info.txt', "Contact-Name: First\r\nDescription: Start\r\n  continuation\r\ncontact-name: Second\r\n");
+        $entries = $this->bags->readMetadata($root);
+        self::assertSame(['Contact-Name', 'Description', 'contact-name'], array_column($entries, 'label'));
+        self::assertSame('First', $entries[0]->value);
+        self::assertSame('Second', $entries[2]->value);
+        self::assertStringContainsString('continuation', $entries[1]->value);
+        unlink($root.'/bag-info.txt');
+        self::assertSame([], $this->bags->readMetadata($root));
+        self::assertTrue($this->bags->inspect($root)->isValid());
+    }
+
+    public function testOfflineInspectionDoesNotDownloadFetchOrModifyFiles(): void
+    {
+        $root = $this->root.'/bag';
+        $this->bags->create($this->root.'/source', $root);
+        file_put_contents($root.'/fetch.txt', "http://127.0.0.1:1/must-not-fetch 2 data/info.json\n");
+        $before = [];
+        foreach (\Survos\BagIt\Filesystem::files($root) as $path) {
+            $before[$path] = hash_file('sha256', $root.'/'.$path);
+        }
+        self::assertTrue($this->bags->inspect($root)->isValid());
+        foreach ($before as $path => $hash) {
+            self::assertSame($hash, hash_file('sha256', $root.'/'.$path));
+        }
+        file_put_contents($root.'/bag-info.txt', "BagIt-Profile-Identifier: http://127.0.0.1:1/must-not-fetch\n");
+        $report = $this->bags->inspect($root);
+        self::assertFalse($report->isValid());
+        self::assertSame('unsafe_or_unsupported_bag', $report->errors[0]->code);
+        self::assertStringContainsString('profiles require network', $report->errors[0]->message);
+    }
+
+    public function testMalformedManifestCannotReachUpstreamHashing(): void
+    {
+        $root = $this->root.'/bag';
+        $this->bags->create($this->root.'/source', $root);
+        unlink($root.'/tagmanifest-sha256.txt');
+        file_put_contents($root.'/manifest-sha256.txt', hash('sha256', 'x')." data/../../outside\n");
+        $report = $this->bags->inspect($root);
+        self::assertSame('invalid_manifest', $report->errors[0]->code);
+        self::assertNull($report->verification);
+    }
+
+    public function testFetchPathsAreCheckedBeforeUpstreamNormalization(): void
+    {
+        $root = $this->root.'/bag';
+        $this->bags->create($this->root.'/source', $root);
+        foreach (['../outside', '/data/info.json', 'info.json', 'data/../info.json'] as $path) {
+            file_put_contents($root.'/fetch.txt', 'http://127.0.0.1:1/not-used - '.$path."\n");
+            $report = $this->bags->inspect($root);
+            self::assertFalse($report->isValid());
+            self::assertSame('unsafe_fetch', $report->errors[0]->code);
+        }
     }
 }
